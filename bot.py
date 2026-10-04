@@ -43,6 +43,38 @@ CREATE TABLE IF NOT EXISTS storage (
 )
 """)
 
+# Add the new access column to existing databases without deleting old deposits.
+cursor.execute("PRAGMA table_info(storage)")
+storage_columns = {row[1] for row in cursor.fetchall()}
+
+if "access_type" not in storage_columns:
+    cursor.execute(
+        "ALTER TABLE storage "
+        "ADD COLUMN access_type TEXT NOT NULL DEFAULT 'personal'"
+    )
+
+# Rebuild the table once so the same item can exist in both PERSONAL and SHARED storage.
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS storage_v2 (
+    guild_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    item TEXT NOT NULL,
+    amount INTEGER NOT NULL,
+    access_type TEXT NOT NULL DEFAULT 'personal',
+    PRIMARY KEY (guild_id, user_id, item, access_type)
+)
+""")
+
+cursor.execute("""
+INSERT OR IGNORE INTO storage_v2
+(guild_id, user_id, item, amount, access_type)
+SELECT guild_id, user_id, item, amount, access_type
+FROM storage
+""")
+
+cursor.execute("DROP TABLE storage")
+cursor.execute("ALTER TABLE storage_v2 RENAME TO storage")
+
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS panels (
     guild_id INTEGER PRIMARY KEY,
@@ -239,10 +271,10 @@ async def update_storage_panel(
 
         cursor.execute(
             """
-            SELECT user_id, item, amount
+            SELECT user_id, item, amount, access_type
             FROM storage
             WHERE guild_id = ?
-            ORDER BY user_id ASC, item ASC
+            ORDER BY user_id ASC, access_type ASC, item ASC
             """,
             (guild.id,)
         )
@@ -287,13 +319,13 @@ async def update_storage_panel(
 
     users = {}
 
-    for user_id, item, amount in all_items:
+    for user_id, item, amount, access_type in all_items:
 
         if user_id not in users:
             users[user_id] = []
 
         users[user_id].append(
-            (item, amount)
+            (item, amount, access_type)
         )
 
 
@@ -312,10 +344,13 @@ async def update_storage_panel(
 
         lines = []
 
-        for item, amount in items:
+        for item, amount, access_type in items:
+
+            icon = "🔒" if access_type == "personal" else "🌐"
+            label = "Personal" if access_type == "personal" else "Everyone"
 
             lines.append(
-                f"• **{item}** — `{amount:,}`"
+                f"{icon} **{item}** — `{amount:,}` • {label}"
             )
 
         item_text = "\n".join(lines)
@@ -355,59 +390,58 @@ async def update_storage_panel(
 
 @bot.tree.command(
     name="deposit",
-    description="Deposit an item into your house storage."
+    description="Deposit an item into house storage."
 )
 @app_commands.describe(
     amount="Amount you are depositing",
-    item="Item you are depositing"
+    item="Item you are depositing",
+    access="Who is allowed to use this deposit?"
+)
+@app_commands.choices(
+    access=[
+        app_commands.Choice(name="🔒 Personal use", value="personal"),
+        app_commands.Choice(name="🌐 Everyone can use it", value="shared"),
+    ]
 )
 async def deposit(
     interaction: discord.Interaction,
     amount: int,
-    item: str
+    item: str,
+    access: app_commands.Choice[str]
 ):
 
     if interaction.guild is None:
-
         await interaction.response.send_message(
             "❌ This command can only be used in a server.",
             ephemeral=True
         )
         return
 
-
     if amount <= 0:
-
         await interaction.response.send_message(
             "❌ Amount must be greater than 0.",
             ephemeral=True
         )
         return
 
-
     item = clean_item_name(item)
-
+    access_type = access.value
 
     if not item:
-
         await interaction.response.send_message(
             "❌ You need to enter an item.",
             ephemeral=True
         )
         return
 
-
     if len(item) > 100:
-
         await interaction.response.send_message(
             "❌ Item names must be 100 characters or less.",
             ephemeral=True
         )
         return
 
-
     async with database_lock:
-
         cursor.execute(
             """
             SELECT amount
@@ -415,19 +449,19 @@ async def deposit(
             WHERE guild_id = ?
             AND user_id = ?
             AND item = ?
+            AND access_type = ?
             """,
             (
                 interaction.guild.id,
                 interaction.user.id,
-                item
+                item,
+                access_type
             )
         )
 
         result = cursor.fetchone()
 
-
         if result:
-
             new_amount = result[0] + amount
 
             cursor.execute(
@@ -437,41 +471,41 @@ async def deposit(
                 WHERE guild_id = ?
                 AND user_id = ?
                 AND item = ?
+                AND access_type = ?
                 """,
                 (
                     new_amount,
                     interaction.guild.id,
                     interaction.user.id,
-                    item
+                    item,
+                    access_type
                 )
             )
-
         else:
-
             new_amount = amount
 
             cursor.execute(
                 """
                 INSERT INTO storage
-                (
-                    guild_id,
-                    user_id,
-                    item,
-                    amount
-                )
-                VALUES (?, ?, ?, ?)
+                (guild_id, user_id, item, amount, access_type)
+                VALUES (?, ?, ?, ?, ?)
                 """,
                 (
                     interaction.guild.id,
                     interaction.user.id,
                     item,
-                    amount
+                    amount,
+                    access_type
                 )
             )
 
-
         database.commit()
 
+    access_text = (
+        "🔒 Personal use"
+        if access_type == "personal"
+        else "🌐 Everyone can use it"
+    )
 
     embed = discord.Embed(
         title="📦 Deposit Successful",
@@ -483,23 +517,23 @@ async def deposit(
         value=f"**{amount:,} × {item}**",
         inline=False
     )
-
     embed.add_field(
-        name="Your Total",
+        name="Access",
+        value=access_text,
+        inline=False
+    )
+    embed.add_field(
+        name="Total in this category",
         value=f"**{new_amount:,} × {item}**",
         inline=False
     )
-
 
     await interaction.response.send_message(
         embed=embed,
         ephemeral=True
     )
 
-
-    await update_storage_panel(
-        interaction.guild
-    )
+    await update_storage_panel(interaction.guild)
 
 
 # ============================================================
@@ -508,105 +542,61 @@ async def deposit(
 
 @bot.tree.command(
     name="withdraw",
-    description="Withdraw an item from your house storage."
+    description="Withdraw personal items or items shared with everyone."
 )
 @app_commands.describe(
     amount="Amount you are withdrawing",
-    item="Item you are withdrawing"
+    item="Item you are withdrawing",
+    access="Which storage pool are you withdrawing from?"
+)
+@app_commands.choices(
+    access=[
+        app_commands.Choice(name="🔒 My personal storage", value="personal"),
+        app_commands.Choice(name="🌐 Shared storage", value="shared"),
+    ]
 )
 async def withdraw(
     interaction: discord.Interaction,
     amount: int,
-    item: str
+    item: str,
+    access: app_commands.Choice[str]
 ):
 
     if interaction.guild is None:
-
         await interaction.response.send_message(
             "❌ This command can only be used in a server.",
             ephemeral=True
         )
         return
 
-
     if amount <= 0:
-
         await interaction.response.send_message(
             "❌ Amount must be greater than 0.",
             ephemeral=True
         )
         return
 
-
     item = clean_item_name(item)
-
+    access_type = access.value
 
     if not item:
-
         await interaction.response.send_message(
             "❌ You need to enter an item.",
             ephemeral=True
         )
         return
 
-
     async with database_lock:
 
-        cursor.execute(
-            """
-            SELECT amount
-            FROM storage
-            WHERE guild_id = ?
-            AND user_id = ?
-            AND item = ?
-            """,
-            (
-                interaction.guild.id,
-                interaction.user.id,
-                item
-            )
-        )
-
-        result = cursor.fetchone()
-
-
-    if not result:
-
-        await interaction.response.send_message(
-            f"❌ You don't have **{item}** in storage.",
-            ephemeral=True
-        )
-        return
-
-
-    current_amount = result[0]
-
-
-    if amount > current_amount:
-
-        await interaction.response.send_message(
-            (
-                f"❌ You only have "
-                f"**{current_amount:,} × {item}**."
-            ),
-            ephemeral=True
-        )
-        return
-
-
-    new_amount = current_amount - amount
-
-
-    async with database_lock:
-
-        if new_amount == 0:
-
+        if access_type == "personal":
             cursor.execute(
                 """
-                DELETE FROM storage
+                SELECT amount
+                FROM storage
                 WHERE guild_id = ?
                 AND user_id = ?
                 AND item = ?
+                AND access_type = 'personal'
                 """,
                 (
                     interaction.guild.id,
@@ -614,56 +604,189 @@ async def withdraw(
                     item
                 )
             )
+
+            result = cursor.fetchone()
+
+            if not result:
+                await interaction.response.send_message(
+                    f"❌ You don't have **{item}** in personal storage.",
+                    ephemeral=True
+                )
+                return
+
+            current_amount = result[0]
+
+            if amount > current_amount:
+                await interaction.response.send_message(
+                    f"❌ You only have **{current_amount:,} × {item}** personally.",
+                    ephemeral=True
+                )
+                return
+
+            new_amount = current_amount - amount
+
+            if new_amount == 0:
+                cursor.execute(
+                    """
+                    DELETE FROM storage
+                    WHERE guild_id = ?
+                    AND user_id = ?
+                    AND item = ?
+                    AND access_type = 'personal'
+                    """,
+                    (
+                        interaction.guild.id,
+                        interaction.user.id,
+                        item
+                    )
+                )
+            else:
+                cursor.execute(
+                    """
+                    UPDATE storage
+                    SET amount = ?
+                    WHERE guild_id = ?
+                    AND user_id = ?
+                    AND item = ?
+                    AND access_type = 'personal'
+                    """,
+                    (
+                        new_amount,
+                        interaction.guild.id,
+                        interaction.user.id,
+                        item
+                    )
+                )
+
+            remaining_text = f"{new_amount:,}"
 
         else:
-
             cursor.execute(
                 """
-                UPDATE storage
-                SET amount = ?
+                SELECT COALESCE(SUM(amount), 0)
+                FROM storage
                 WHERE guild_id = ?
-                AND user_id = ?
                 AND item = ?
+                AND access_type = 'shared'
                 """,
                 (
-                    new_amount,
                     interaction.guild.id,
-                    interaction.user.id,
                     item
                 )
             )
 
+            shared_total = cursor.fetchone()[0]
+
+            if shared_total <= 0:
+                await interaction.response.send_message(
+                    f"❌ There is no shared **{item}** available.",
+                    ephemeral=True
+                )
+                return
+
+            if amount > shared_total:
+                await interaction.response.send_message(
+                    f"❌ Shared storage only has **{shared_total:,} × {item}**.",
+                    ephemeral=True
+                )
+                return
+
+            amount_left = amount
+
+            cursor.execute(
+                """
+                SELECT user_id, amount
+                FROM storage
+                WHERE guild_id = ?
+                AND item = ?
+                AND access_type = 'shared'
+                ORDER BY rowid ASC
+                """,
+                (
+                    interaction.guild.id,
+                    item
+                )
+            )
+
+            deposits = cursor.fetchall()
+
+            for owner_id, owner_amount in deposits:
+                if amount_left <= 0:
+                    break
+
+                take = min(owner_amount, amount_left)
+                owner_remaining = owner_amount - take
+                amount_left -= take
+
+                if owner_remaining == 0:
+                    cursor.execute(
+                        """
+                        DELETE FROM storage
+                        WHERE guild_id = ?
+                        AND user_id = ?
+                        AND item = ?
+                        AND access_type = 'shared'
+                        """,
+                        (
+                            interaction.guild.id,
+                            owner_id,
+                            item
+                        )
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        UPDATE storage
+                        SET amount = ?
+                        WHERE guild_id = ?
+                        AND user_id = ?
+                        AND item = ?
+                        AND access_type = 'shared'
+                        """,
+                        (
+                            owner_remaining,
+                            interaction.guild.id,
+                            owner_id,
+                            item
+                        )
+                    )
+
+            remaining_text = f"{shared_total - amount:,}"
 
         database.commit()
 
+    pool_text = (
+        "🔒 Personal storage"
+        if access_type == "personal"
+        else "🌐 Shared storage"
+    )
 
     embed = discord.Embed(
         title="📤 Withdrawal Successful",
         color=discord.Color.red()
     )
-
     embed.add_field(
         name="Withdrawn",
         value=f"**{amount:,} × {item}**",
         inline=False
     )
-
     embed.add_field(
-        name="Remaining",
-        value=f"**{new_amount:,} × {item}**",
+        name="From",
+        value=pool_text,
         inline=False
     )
-
+    embed.add_field(
+        name="Remaining in that pool",
+        value=f"**{remaining_text} × {item}**",
+        inline=False
+    )
 
     await interaction.response.send_message(
         embed=embed,
         ephemeral=True
     )
 
-
-    await update_storage_panel(
-        interaction.guild
-    )
+    await update_storage_panel(interaction.guild)
 
 
 # ============================================================
@@ -672,29 +795,27 @@ async def withdraw(
 
 @bot.tree.command(
     name="storage",
-    description="View your personal house storage."
+    description="View your personal items and shared house storage."
 )
 async def storage(
     interaction: discord.Interaction
 ):
 
     if interaction.guild is None:
-
         await interaction.response.send_message(
             "❌ This command can only be used in a server.",
             ephemeral=True
         )
         return
 
-
     async with database_lock:
-
         cursor.execute(
             """
             SELECT item, amount
             FROM storage
             WHERE guild_id = ?
             AND user_id = ?
+            AND access_type = 'personal'
             ORDER BY item ASC
             """,
             (
@@ -702,51 +823,56 @@ async def storage(
                 interaction.user.id
             )
         )
+        personal_items = cursor.fetchall()
 
-        items = cursor.fetchall()
-
+        cursor.execute(
+            """
+            SELECT item, SUM(amount)
+            FROM storage
+            WHERE guild_id = ?
+            AND access_type = 'shared'
+            GROUP BY item
+            ORDER BY item ASC
+            """,
+            (interaction.guild.id,)
+        )
+        shared_items = cursor.fetchall()
 
     embed = discord.Embed(
-        title="🏠 Your House Storage",
+        title="🏠 House Storage",
         color=discord.Color.blue()
     )
 
-
-    if not items:
-
-        embed.description = (
-            "📭 Your storage is currently empty."
+    if personal_items:
+        personal_text = "\n".join(
+            f"• **{item}** — `{amount:,}`"
+            for item, amount in personal_items
         )
-
     else:
+        personal_text = "📭 No personal items."
 
-        lines = []
-
-        for item, amount in items:
-
-            lines.append(
-                f"• **{item}** — `{amount:,}`"
-            )
-
-        storage_text = "\n".join(lines)
-
-        if len(storage_text) > 4000:
-
-            storage_text = (
-                storage_text[:3900]
-                + "\n*More items not shown...*"
-            )
-
-        embed.description = storage_text
-
-
-    embed.set_footer(
-        text=(
-            f"Storage belonging to "
-            f"{interaction.user.display_name}"
+    if shared_items:
+        shared_text = "\n".join(
+            f"• **{item}** — `{amount:,}`"
+            for item, amount in shared_items
         )
+    else:
+        shared_text = "📭 No shared items."
+
+    embed.add_field(
+        name="🔒 Your Personal Storage",
+        value=personal_text[:1024],
+        inline=False
+    )
+    embed.add_field(
+        name="🌐 Everyone Can Use",
+        value=shared_text[:1024],
+        inline=False
     )
 
+    embed.set_footer(
+        text=f"Viewing storage as {interaction.user.display_name}"
+    )
 
     await interaction.response.send_message(
         embed=embed,
@@ -888,57 +1014,54 @@ async def setuppanel(
 
 @bot.tree.command(
     name="adminremove",
-    description="Admin: Remove items from another user's storage."
+    description="Admin: Remove a user's personal or shared deposit."
 )
 @app_commands.describe(
-    user="User whose storage you want to modify",
+    user="User whose deposit you want to modify",
     amount="Amount you want to remove",
-    item="Item you want to remove"
+    item="Item you want to remove",
+    access="Remove their personal or shared deposit?"
 )
-@app_commands.checks.has_permissions(
-    administrator=True
+@app_commands.choices(
+    access=[
+        app_commands.Choice(name="🔒 Personal", value="personal"),
+        app_commands.Choice(name="🌐 Shared", value="shared"),
+    ]
 )
+@app_commands.checks.has_permissions(administrator=True)
 async def adminremove(
     interaction: discord.Interaction,
     user: discord.Member,
     amount: int,
-    item: str
+    item: str,
+    access: app_commands.Choice[str]
 ):
 
     if interaction.guild is None:
-
         await interaction.response.send_message(
             "❌ This command can only be used in a server.",
             ephemeral=True
         )
         return
 
-
     if amount <= 0:
-
         await interaction.response.send_message(
             "❌ Amount must be greater than 0.",
             ephemeral=True
         )
         return
 
-
     item = clean_item_name(item)
-
+    access_type = access.value
 
     if not item:
-
         await interaction.response.send_message(
             "❌ You need to enter an item.",
             ephemeral=True
         )
         return
 
-
-    # Get the selected user's item.
-
     async with database_lock:
-
         cursor.execute(
             """
             SELECT amount
@@ -946,69 +1069,55 @@ async def adminremove(
             WHERE guild_id = ?
             AND user_id = ?
             AND item = ?
+            AND access_type = ?
             """,
             (
                 interaction.guild.id,
                 user.id,
-                item
+                item,
+                access_type
             )
         )
 
         result = cursor.fetchone()
 
+        if not result:
+            await interaction.response.send_message(
+                f"❌ **{user.display_name}** doesn't have **{item}** "
+                f"in that storage category.",
+                ephemeral=True
+            )
+            return
 
-    if not result:
+        current_amount = result[0]
 
-        await interaction.response.send_message(
-            (
-                f"❌ **{user.display_name}** doesn't have "
-                f"**{item}** in storage."
-            ),
-            ephemeral=True
-        )
-        return
-
-
-    current_amount = result[0]
-
-
-    if amount > current_amount:
-
-        await interaction.response.send_message(
-            (
+        if amount > current_amount:
+            await interaction.response.send_message(
                 f"❌ **{user.display_name}** only has "
-                f"**{current_amount:,} × {item}**."
-            ),
-            ephemeral=True
-        )
-        return
+                f"**{current_amount:,} × {item}** in that category.",
+                ephemeral=True
+            )
+            return
 
-
-    new_amount = current_amount - amount
-
-
-    # Modify target user's storage.
-
-    async with database_lock:
+        new_amount = current_amount - amount
 
         if new_amount == 0:
-
             cursor.execute(
                 """
                 DELETE FROM storage
                 WHERE guild_id = ?
                 AND user_id = ?
                 AND item = ?
+                AND access_type = ?
                 """,
                 (
                     interaction.guild.id,
                     user.id,
-                    item
+                    item,
+                    access_type
                 )
             )
-
         else:
-
             cursor.execute(
                 """
                 UPDATE storage
@@ -1016,63 +1125,47 @@ async def adminremove(
                 WHERE guild_id = ?
                 AND user_id = ?
                 AND item = ?
+                AND access_type = ?
                 """,
                 (
                     new_amount,
                     interaction.guild.id,
                     user.id,
-                    item
+                    item,
+                    access_type
                 )
             )
 
-
         database.commit()
 
-
-    # Confirmation.
+    category = "🔒 Personal" if access_type == "personal" else "🌐 Shared"
 
     embed = discord.Embed(
         title="🛡️ Admin Storage Adjustment",
         color=discord.Color.orange()
     )
-
-    embed.add_field(
-        name="User",
-        value=user.mention,
-        inline=False
-    )
-
+    embed.add_field(name="User", value=user.mention, inline=False)
+    embed.add_field(name="Category", value=category, inline=False)
     embed.add_field(
         name="Removed",
         value=f"**{amount:,} × {item}**",
         inline=False
     )
-
     embed.add_field(
         name="Remaining",
         value=f"**{new_amount:,} × {item}**",
         inline=False
     )
-
     embed.set_footer(
-        text=(
-            f"Removed by "
-            f"{interaction.user.display_name}"
-        )
+        text=f"Removed by {interaction.user.display_name}"
     )
-
 
     await interaction.response.send_message(
         embed=embed,
         ephemeral=True
     )
 
-
-    # Refresh public panel.
-
-    await update_storage_panel(
-        interaction.guild
-    )
+    await update_storage_panel(interaction.guild)
 
 
 # ============================================================
