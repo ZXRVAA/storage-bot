@@ -12,8 +12,6 @@ from discord.ext import commands
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 
-# Railway Volume should be mounted at /data.
-# Locally, the bot falls back to the current directory.
 DATABASE_PATH = os.getenv(
     "DATABASE_PATH",
     "house_storage.db"
@@ -34,8 +32,20 @@ database = sqlite3.connect(DATABASE_PATH)
 cursor = database.cursor()
 
 
-# Storage is separated by:
-# Discord server -> Discord user -> item
+# ------------------------------------------------------------
+# STORAGE TABLE
+#
+# Every item belongs to:
+#
+# Discord Server
+#     ↓
+# Discord User
+#     ↓
+# Item
+#     ↓
+# Amount
+# ------------------------------------------------------------
+
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS storage (
     guild_id INTEGER NOT NULL,
@@ -47,7 +57,12 @@ CREATE TABLE IF NOT EXISTS storage (
 """)
 
 
-# Stores the shared panel for each Discord server
+# ------------------------------------------------------------
+# SHARED PANEL TABLE
+#
+# Remembers where each server's public panel is located.
+# ------------------------------------------------------------
+
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS panels (
     guild_id INTEGER PRIMARY KEY,
@@ -60,303 +75,20 @@ CREATE TABLE IF NOT EXISTS panels (
 database.commit()
 
 
-# Lock prevents two deposits/withdrawals from
-# changing the database at exactly the same time.
+# Prevent multiple commands from changing
+# the database simultaneously.
 database_lock = asyncio.Lock()
 
 
 # ============================================================
-# DISCORD BOT
+# BOT SETUP
 # ============================================================
 
 intents = discord.Intents.default()
 
-# Needed so the bot can reliably resolve server members
+# Required for resolving Discord members/display names.
 intents.members = True
 
-bot = commands.Bot(
-    command_prefix="!",
-    intents=intents
-)
-
-
-# ============================================================
-# HELPER: NORMALIZE ITEM NAME
-# ============================================================
-
-def clean_item_name(item: str) -> str:
-    """
-    Cleans item names so:
-    hardwood boards
-    HARDWOOD BOARDS
-    Hardwood Boards
-
-    all become:
-    Hardwood Boards
-    """
-
-    return " ".join(item.strip().split()).title()
-
-
-# ============================================================
-# HELPER: GET USER DISPLAY NAME
-# ============================================================
-
-async def get_member_name(
-    guild: discord.Guild,
-    user_id: int
-) -> str:
-
-    member = guild.get_member(user_id)
-
-    if member:
-        return member.display_name
-
-    try:
-        member = await guild.fetch_member(user_id)
-
-        return member.display_name
-
-    except (
-        discord.NotFound,
-        discord.Forbidden,
-        discord.HTTPException
-    ):
-        return f"Unknown User ({user_id})"
-
-
-# ============================================================
-# SHARED STORAGE PANEL
-# ============================================================
-
-async def update_storage_panel(
-    guild: discord.Guild
-):
-
-    # --------------------------------------------------------
-    # Find the shared panel
-    # --------------------------------------------------------
-
-    async with database_lock:
-
-        cursor.execute(
-            """
-            SELECT channel_id, message_id
-            FROM panels
-            WHERE guild_id = ?
-            """,
-            (guild.id,)
-        )
-
-        panel_data = cursor.fetchone()
-
-    if not panel_data:
-        return
-
-    channel_id, message_id = panel_data
-
-
-    # --------------------------------------------------------
-    # Find channel
-    # --------------------------------------------------------
-
-    channel = guild.get_channel(channel_id)
-
-    if channel is None:
-
-        try:
-            channel = await bot.fetch_channel(channel_id)
-
-        except (
-            discord.NotFound,
-            discord.Forbidden,
-            discord.HTTPException
-        ):
-            return
-
-
-    # --------------------------------------------------------
-    # Find panel message
-    # --------------------------------------------------------
-
-    try:
-
-        message = await channel.fetch_message(
-            message_id
-        )
-
-    except discord.NotFound:
-
-        # Panel was deleted.
-        # Remove old panel information.
-
-        async with database_lock:
-
-            cursor.execute(
-                """
-                DELETE FROM panels
-                WHERE guild_id = ?
-                """,
-                (guild.id,)
-            )
-
-            database.commit()
-
-        return
-
-    except (
-        discord.Forbidden,
-        discord.HTTPException
-    ):
-        return
-
-
-    # --------------------------------------------------------
-    # Get all storage for THIS SERVER ONLY
-    # --------------------------------------------------------
-
-    async with database_lock:
-
-        cursor.execute(
-            """
-            SELECT user_id, item, amount
-            FROM storage
-            WHERE guild_id = ?
-            ORDER BY user_id ASC, item ASC
-            """,
-            (guild.id,)
-        )
-
-        all_items = cursor.fetchall()
-
-
-    # --------------------------------------------------------
-    # Create panel
-    # --------------------------------------------------------
-
-    embed = discord.Embed(
-        title="🏠 HOUSE STORAGE",
-        color=discord.Color.blue()
-    )
-
-
-    # --------------------------------------------------------
-    # Empty storage
-    # --------------------------------------------------------
-
-    if not all_items:
-
-        embed.description = (
-            "📭 **House storage is currently empty.**\n\n"
-            "Use `/deposit` to add items."
-        )
-
-        embed.set_footer(
-            text="Automatically updated"
-        )
-
-        await message.edit(
-            embed=embed
-        )
-
-        return
-
-
-    # --------------------------------------------------------
-    # Organize items by user
-    # --------------------------------------------------------
-
-    users = {}
-
-    for user_id, item, amount in all_items:
-
-        if user_id not in users:
-            users[user_id] = []
-
-        users[user_id].append(
-            (item, amount)
-        )
-
-
-    # --------------------------------------------------------
-    # Add each user's inventory
-    # --------------------------------------------------------
-
-    for user_id, items in users.items():
-
-        username = await get_member_name(
-            guild,
-            user_id
-        )
-
-        item_lines = []
-
-        for item, amount in items:
-
-            item_lines.append(
-                f"• **{item}** — `{amount:,}`"
-            )
-
-        item_text = "\n".join(item_lines)
-
-
-        # Discord embed fields have a character limit.
-        # Prevent huge inventories from breaking the panel.
-
-        if len(item_text) > 1000:
-
-            item_text = (
-                item_text[:950]
-                + "\n\n*More items not shown...*"
-            )
-
-
-        # Discord embeds can only contain 25 fields.
-        if len(embed.fields) >= 25:
-            break
-
-
-        embed.add_field(
-            name=f"👤 {username}",
-            value=item_text,
-            inline=False
-        )
-
-
-    embed.set_footer(
-        text=(
-            "Use /deposit to add items • "
-            "/withdraw to remove items"
-        )
-    )
-
-
-    try:
-
-        await message.edit(
-            embed=embed
-        )
-
-    except discord.HTTPException:
-        pass
-
-
-# ============================================================
-# BOT READY
-# ============================================================
-
-@bot.event
-async def on_ready():
-
-    print("=" * 55)
-    print(f"Logged in as: {bot.user}")
-    print(f"Bot ID: {bot.user.id}")
-    print("=" * 55)
-
-
-# ============================================================
-# SYNC COMMANDS ON STARTUP
-# ============================================================
 
 class StorageBot(commands.Bot):
 
@@ -377,20 +109,328 @@ class StorageBot(commands.Bot):
             )
 
 
-# Re-create bot using our StorageBot class
 bot = StorageBot(
     command_prefix="!",
     intents=intents
 )
 
 
+# ============================================================
+# BOT READY
+# ============================================================
+
 @bot.event
 async def on_ready():
 
     print("=" * 55)
     print(f"Logged in as: {bot.user}")
+    print(f"Bot ID: {bot.user.id}")
     print("House Storage Bot is ONLINE!")
     print("=" * 55)
+
+
+# ============================================================
+# HELPER: CLEAN ITEM NAME
+# ============================================================
+
+def clean_item_name(item: str) -> str:
+
+    # Example:
+    #
+    # hardwood boards
+    # HARDWOOD BOARDS
+    # Hardwood    Boards
+    #
+    # All become:
+    #
+    # Hardwood Boards
+
+    return " ".join(
+        item.strip().split()
+    ).title()
+
+
+# ============================================================
+# HELPER: GET MEMBER NAME
+# ============================================================
+
+async def get_member_name(
+    guild: discord.Guild,
+    user_id: int
+) -> str:
+
+    member = guild.get_member(user_id)
+
+    if member:
+
+        return member.display_name
+
+
+    try:
+
+        member = await guild.fetch_member(
+            user_id
+        )
+
+        return member.display_name
+
+    except (
+        discord.NotFound,
+        discord.Forbidden,
+        discord.HTTPException
+    ):
+
+        return f"Unknown User ({user_id})"
+
+
+# ============================================================
+# SHARED STORAGE PANEL
+# ============================================================
+
+async def update_storage_panel(
+    guild: discord.Guild
+):
+
+    # --------------------------------------------------------
+    # Find panel information
+    # --------------------------------------------------------
+
+    async with database_lock:
+
+        cursor.execute(
+            """
+            SELECT channel_id, message_id
+            FROM panels
+            WHERE guild_id = ?
+            """,
+            (guild.id,)
+        )
+
+        panel_data = cursor.fetchone()
+
+
+    # Server doesn't have a panel yet
+    if not panel_data:
+        return
+
+
+    channel_id, message_id = panel_data
+
+
+    # --------------------------------------------------------
+    # Find channel
+    # --------------------------------------------------------
+
+    channel = guild.get_channel(
+        channel_id
+    )
+
+
+    if channel is None:
+
+        try:
+
+            channel = await bot.fetch_channel(
+                channel_id
+            )
+
+        except (
+            discord.NotFound,
+            discord.Forbidden,
+            discord.HTTPException
+        ):
+
+            return
+
+
+    # --------------------------------------------------------
+    # Find panel message
+    # --------------------------------------------------------
+
+    try:
+
+        message = await channel.fetch_message(
+            message_id
+        )
+
+    except discord.NotFound:
+
+        # Panel message was deleted.
+        # Forget the old panel.
+
+        async with database_lock:
+
+            cursor.execute(
+                """
+                DELETE FROM panels
+                WHERE guild_id = ?
+                """,
+                (guild.id,)
+            )
+
+            database.commit()
+
+        return
+
+    except (
+        discord.Forbidden,
+        discord.HTTPException
+    ):
+
+        return
+
+
+    # --------------------------------------------------------
+    # Get ALL storage for THIS SERVER
+    # --------------------------------------------------------
+
+    async with database_lock:
+
+        cursor.execute(
+            """
+            SELECT user_id, item, amount
+            FROM storage
+            WHERE guild_id = ?
+            ORDER BY user_id ASC, item ASC
+            """,
+            (guild.id,)
+        )
+
+        all_items = cursor.fetchall()
+
+
+    # --------------------------------------------------------
+    # Build panel
+    # --------------------------------------------------------
+
+    embed = discord.Embed(
+        title="🏠 HOUSE STORAGE",
+        color=discord.Color.blue()
+    )
+
+
+    # --------------------------------------------------------
+    # Empty storage
+    # --------------------------------------------------------
+
+    if not all_items:
+
+        embed.description = (
+            "📭 **House storage is currently empty.**\n\n"
+            "Use `/deposit` to add items."
+        )
+
+        embed.set_footer(
+            text=(
+                "Use /deposit to add items • "
+                "/withdraw to remove items"
+            )
+        )
+
+        try:
+
+            await message.edit(
+                embed=embed
+            )
+
+        except discord.HTTPException:
+            pass
+
+        return
+
+
+    # --------------------------------------------------------
+    # Group storage by user
+    # --------------------------------------------------------
+
+    users = {}
+
+
+    for user_id, item, amount in all_items:
+
+        if user_id not in users:
+
+            users[user_id] = []
+
+
+        users[user_id].append(
+            (item, amount)
+        )
+
+
+    # --------------------------------------------------------
+    # Add users to panel
+    # --------------------------------------------------------
+
+    for user_id, items in users.items():
+
+        # Discord embeds have a maximum
+        # of 25 fields.
+
+        if len(embed.fields) >= 25:
+
+            break
+
+
+        username = await get_member_name(
+            guild,
+            user_id
+        )
+
+
+        item_lines = []
+
+
+        for item, amount in items:
+
+            item_lines.append(
+                f"• **{item}** — `{amount:,}`"
+            )
+
+
+        item_text = "\n".join(
+            item_lines
+        )
+
+
+        # Keep field below Discord limit.
+
+        if len(item_text) > 1000:
+
+            item_text = (
+                item_text[:950]
+                + "\n\n*More items not shown...*"
+            )
+
+
+        embed.add_field(
+            name=f"👤 {username}",
+            value=item_text,
+            inline=False
+        )
+
+
+    embed.set_footer(
+        text=(
+            "Use /deposit to add items • "
+            "/withdraw to remove items"
+        )
+    )
+
+
+    # --------------------------------------------------------
+    # Update Discord message
+    # --------------------------------------------------------
+
+    try:
+
+        await message.edit(
+            embed=embed
+        )
+
+    except discord.HTTPException:
+
+        pass
 
 
 # ============================================================
@@ -408,10 +448,14 @@ async def setuppanel(
     interaction: discord.Interaction
 ):
 
+    # --------------------------------------------------------
+    # Must be inside server
+    # --------------------------------------------------------
+
     if interaction.guild is None:
 
         await interaction.response.send_message(
-            "❌ This command can only be used in a server.",
+            "❌ This command can only be used inside a server.",
             ephemeral=True
         )
 
@@ -419,7 +463,7 @@ async def setuppanel(
 
 
     # --------------------------------------------------------
-    # Check for existing panel
+    # Find existing panel
     # --------------------------------------------------------
 
     async with database_lock:
@@ -436,20 +480,30 @@ async def setuppanel(
         existing_panel = cursor.fetchone()
 
 
+    # --------------------------------------------------------
+    # Delete old panel
+    # --------------------------------------------------------
+
     if existing_panel:
 
-        old_channel_id, old_message_id = existing_panel
+        old_channel_id, old_message_id = (
+            existing_panel
+        )
+
 
         old_channel = interaction.guild.get_channel(
             old_channel_id
         )
 
+
         if old_channel:
 
             try:
 
-                old_message = await old_channel.fetch_message(
-                    old_message_id
+                old_message = (
+                    await old_channel.fetch_message(
+                        old_message_id
+                    )
                 )
 
                 await old_message.delete()
@@ -459,6 +513,7 @@ async def setuppanel(
                 discord.Forbidden,
                 discord.HTTPException
             ):
+
                 pass
 
 
@@ -474,6 +529,7 @@ async def setuppanel(
         ),
         color=discord.Color.blue()
     )
+
 
     embed.set_footer(
         text=(
@@ -519,6 +575,8 @@ async def setuppanel(
         database.commit()
 
 
+    # Populate existing storage if there is any.
+
     await update_storage_panel(
         interaction.guild
     )
@@ -557,7 +615,7 @@ async def deposit(
 
 
     # --------------------------------------------------------
-    # Amount validation
+    # Amount check
     # --------------------------------------------------------
 
     if amount <= 0:
@@ -571,10 +629,13 @@ async def deposit(
 
 
     # --------------------------------------------------------
-    # Item validation
+    # Clean item
     # --------------------------------------------------------
 
-    item = clean_item_name(item)
+    item = clean_item_name(
+        item
+    )
+
 
     if not item:
 
@@ -617,10 +678,14 @@ async def deposit(
             )
         )
 
+
         result = cursor.fetchone()
 
 
+        # ----------------------------------------------------
         # Existing item
+        # ----------------------------------------------------
+
         if result:
 
             current_amount = result[0]
@@ -628,6 +693,7 @@ async def deposit(
             new_amount = (
                 current_amount + amount
             )
+
 
             cursor.execute(
                 """
@@ -646,10 +712,14 @@ async def deposit(
             )
 
 
+        # ----------------------------------------------------
         # New item
+        # ----------------------------------------------------
+
         else:
 
             new_amount = amount
+
 
             cursor.execute(
                 """
@@ -683,6 +753,7 @@ async def deposit(
         color=discord.Color.green()
     )
 
+
     embed.add_field(
         name="Deposited",
         value=(
@@ -690,6 +761,7 @@ async def deposit(
         ),
         inline=False
     )
+
 
     embed.add_field(
         name="Your Total",
@@ -707,7 +779,7 @@ async def deposit(
 
 
     # --------------------------------------------------------
-    # Refresh shared panel
+    # Update shared panel
     # --------------------------------------------------------
 
     await update_storage_panel(
@@ -765,7 +837,10 @@ async def withdraw(
     # Clean item
     # --------------------------------------------------------
 
-    item = clean_item_name(item)
+    item = clean_item_name(
+        item
+    )
+
 
     if not item:
 
@@ -798,20 +873,15 @@ async def withdraw(
             )
         )
 
+
         result = cursor.fetchone()
 
 
-        # Item doesn't exist
-        if not result:
+    # --------------------------------------------------------
+    # Doesn't own item
+    # --------------------------------------------------------
 
-            current_amount = None
-
-        else:
-
-            current_amount = result[0]
-
-
-    if current_amount is None:
+    if not result:
 
         await interaction.response.send_message(
             (
@@ -824,6 +894,9 @@ async def withdraw(
         return
 
 
+    current_amount = result[0]
+
+
     # --------------------------------------------------------
     # Not enough
     # --------------------------------------------------------
@@ -832,7 +905,8 @@ async def withdraw(
 
         await interaction.response.send_message(
             (
-                f"❌ You don't have enough **{item}**.\n\n"
+                f"❌ You don't have enough "
+                f"**{item}**.\n\n"
                 f"You currently have "
                 f"**{current_amount:,}**."
             ),
@@ -853,6 +927,8 @@ async def withdraw(
 
     async with database_lock:
 
+        # Remove item entirely at zero.
+
         if new_amount == 0:
 
             cursor.execute(
@@ -868,6 +944,7 @@ async def withdraw(
                     item
                 )
             )
+
 
         else:
 
@@ -900,6 +977,7 @@ async def withdraw(
         color=discord.Color.red()
     )
 
+
     embed.add_field(
         name="Withdrawn",
         value=(
@@ -916,6 +994,7 @@ async def withdraw(
             value="**0**",
             inline=False
         )
+
 
     else:
 
@@ -935,7 +1014,7 @@ async def withdraw(
 
 
     # --------------------------------------------------------
-    # Refresh shared panel
+    # Update shared panel
     # --------------------------------------------------------
 
     await update_storage_panel(
@@ -954,6 +1033,10 @@ async def withdraw(
 async def storage(
     interaction: discord.Interaction
 ):
+
+    # --------------------------------------------------------
+    # Server check
+    # --------------------------------------------------------
 
     if interaction.guild is None:
 
@@ -985,11 +1068,12 @@ async def storage(
             )
         )
 
+
         items = cursor.fetchall()
 
 
     # --------------------------------------------------------
-    # Create private inventory
+    # Build personal inventory
     # --------------------------------------------------------
 
     embed = discord.Embed(
@@ -1004,9 +1088,11 @@ async def storage(
             "📭 Your storage is currently empty."
         )
 
+
     else:
 
         item_lines = []
+
 
         for item, amount in items:
 
@@ -1020,7 +1106,8 @@ async def storage(
         )
 
 
-        # Prevent embed becoming too large
+        # Protect against Discord embed limit.
+
         if len(storage_text) > 4000:
 
             storage_text = (
@@ -1047,7 +1134,249 @@ async def storage(
 
 
 # ============================================================
-# COMMAND ERROR HANDLING
+# /ADMINREMOVE
+# ============================================================
+
+@bot.tree.command(
+    name="adminremove",
+    description="Admin: Remove items from another user's storage."
+)
+@app_commands.describe(
+    user="User whose storage you want to modify",
+    amount="Amount you want to remove",
+    item="Item you want to remove"
+)
+@app_commands.checks.has_permissions(
+    administrator=True
+)
+async def adminremove(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    amount: int,
+    item: str
+):
+
+    # --------------------------------------------------------
+    # Server check
+    # --------------------------------------------------------
+
+    if interaction.guild is None:
+
+        await interaction.response.send_message(
+            "❌ This command can only be used inside a server.",
+            ephemeral=True
+        )
+
+        return
+
+
+    # --------------------------------------------------------
+    # Amount check
+    # --------------------------------------------------------
+
+    if amount <= 0:
+
+        await interaction.response.send_message(
+            "❌ Amount must be greater than 0.",
+            ephemeral=True
+        )
+
+        return
+
+
+    # --------------------------------------------------------
+    # Clean item
+    # --------------------------------------------------------
+
+    item = clean_item_name(
+        item
+    )
+
+
+    if not item:
+
+        await interaction.response.send_message(
+            "❌ You need to enter an item name.",
+            ephemeral=True
+        )
+
+        return
+
+
+    # --------------------------------------------------------
+    # Find selected user's item
+    # --------------------------------------------------------
+
+    async with database_lock:
+
+        cursor.execute(
+            """
+            SELECT amount
+            FROM storage
+            WHERE guild_id = ?
+            AND user_id = ?
+            AND item = ?
+            """,
+            (
+                interaction.guild.id,
+                user.id,
+                item
+            )
+        )
+
+
+        result = cursor.fetchone()
+
+
+    # --------------------------------------------------------
+    # Item not found
+    # --------------------------------------------------------
+
+    if not result:
+
+        await interaction.response.send_message(
+            (
+                f"❌ **{user.display_name}** "
+                f"doesn't have **{item}** "
+                f"in storage."
+            ),
+            ephemeral=True
+        )
+
+        return
+
+
+    current_amount = result[0]
+
+
+    # --------------------------------------------------------
+    # Trying to remove too much
+    # --------------------------------------------------------
+
+    if amount > current_amount:
+
+        await interaction.response.send_message(
+            (
+                f"❌ **{user.display_name}** only has "
+                f"**{current_amount:,} × {item}**.\n\n"
+                f"You cannot remove **{amount:,}**."
+            ),
+            ephemeral=True
+        )
+
+        return
+
+
+    new_amount = (
+        current_amount - amount
+    )
+
+
+    # --------------------------------------------------------
+    # Update database
+    # --------------------------------------------------------
+
+    async with database_lock:
+
+        if new_amount == 0:
+
+            cursor.execute(
+                """
+                DELETE FROM storage
+                WHERE guild_id = ?
+                AND user_id = ?
+                AND item = ?
+                """,
+                (
+                    interaction.guild.id,
+                    user.id,
+                    item
+                )
+            )
+
+
+        else:
+
+            cursor.execute(
+                """
+                UPDATE storage
+                SET amount = ?
+                WHERE guild_id = ?
+                AND user_id = ?
+                AND item = ?
+                """,
+                (
+                    new_amount,
+                    interaction.guild.id,
+                    user.id,
+                    item
+                )
+            )
+
+
+        database.commit()
+
+
+    # --------------------------------------------------------
+    # Confirmation
+    # --------------------------------------------------------
+
+    embed = discord.Embed(
+        title="🛡️ Admin Storage Adjustment",
+        color=discord.Color.orange()
+    )
+
+
+    embed.add_field(
+        name="User",
+        value=user.mention,
+        inline=False
+    )
+
+
+    embed.add_field(
+        name="Removed",
+        value=(
+            f"**{amount:,} × {item}**"
+        ),
+        inline=False
+    )
+
+
+    embed.add_field(
+        name="Remaining",
+        value=(
+            f"**{new_amount:,} × {item}**"
+        ),
+        inline=False
+    )
+
+
+    embed.set_footer(
+        text=(
+            f"Removed by "
+            f"{interaction.user.display_name}"
+        )
+    )
+
+
+    await interaction.response.send_message(
+        embed=embed,
+        ephemeral=True
+    )
+
+
+    # --------------------------------------------------------
+    # Refresh public panel
+    # --------------------------------------------------------
+
+    await update_storage_panel(
+        interaction.guild
+    )
+
+
+# ============================================================
+# /SETUPPANEL ERROR
 # ============================================================
 
 @setuppanel.error
@@ -1061,23 +1390,59 @@ async def setuppanel_error(
         app_commands.MissingPermissions
     ):
 
+        message = (
+            "❌ You need the **Manage Server** "
+            "permission to use `/setuppanel`."
+        )
+
+
         if interaction.response.is_done():
 
             await interaction.followup.send(
-                (
-                    "❌ You need the **Manage Server** "
-                    "permission to use `/setuppanel`."
-                ),
+                message,
                 ephemeral=True
             )
 
         else:
 
             await interaction.response.send_message(
-                (
-                    "❌ You need the **Manage Server** "
-                    "permission to use `/setuppanel`."
-                ),
+                message,
+                ephemeral=True
+            )
+
+
+# ============================================================
+# /ADMINREMOVE ERROR
+# ============================================================
+
+@adminremove.error
+async def adminremove_error(
+    interaction: discord.Interaction,
+    error
+):
+
+    if isinstance(
+        error,
+        app_commands.MissingPermissions
+    ):
+
+        message = (
+            "❌ Only Discord administrators "
+            "can use `/adminremove`."
+        )
+
+
+        if interaction.response.is_done():
+
+            await interaction.followup.send(
+                message,
+                ephemeral=True
+            )
+
+        else:
+
+            await interaction.response.send_message(
+                message,
                 ephemeral=True
             )
 
