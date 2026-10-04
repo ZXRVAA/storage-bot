@@ -99,34 +99,26 @@ intents.members = True
 class StorageBot(commands.Bot):
 
     async def setup_hook(self):
-
         guild = discord.Object(id=GUILD_ID)
 
         try:
-            # Copy all commands to your server.
+            self.tree.clear_commands(guild=guild)
             self.tree.copy_global_to(guild=guild)
-
-            # Sync directly to your server.
             synced = await self.tree.sync(guild=guild)
 
             print("")
             print("=" * 55)
-            print(
-                f"Synced {len(synced)} commands "
-                f"to server {GUILD_ID}"
-            )
+            print(f"Synced {len(synced)} commands to server {GUILD_ID}")
 
             for command in synced:
-                print(f" - /{command.name}")
+                option_names = [option.name for option in command.options]
+                print(f" - /{command.name} options: {option_names}")
 
             print("=" * 55)
             print("")
 
         except Exception as error:
-
-            print(
-                f"Command sync failed: {repr(error)}"
-            )
+            print(f"Command sync failed: {repr(error)}")
 
 
 bot = StorageBot(
@@ -542,26 +534,17 @@ async def deposit(
 
 @bot.tree.command(
     name="withdraw",
-    description="Withdraw personal items or items shared with everyone."
+    description="Withdraw an item you are allowed to use."
 )
 @app_commands.describe(
     amount="Amount you are withdrawing",
-    item="Item you are withdrawing",
-    access="Which storage pool are you withdrawing from?"
-)
-@app_commands.choices(
-    access=[
-        app_commands.Choice(name="🔒 My personal storage", value="personal"),
-        app_commands.Choice(name="🌐 Shared storage", value="shared"),
-    ]
+    item="Item you are withdrawing"
 )
 async def withdraw(
     interaction: discord.Interaction,
     amount: int,
-    item: str,
-    access: app_commands.Choice[str]
+    item: str
 ):
-
     if interaction.guild is None:
         await interaction.response.send_message(
             "❌ This command can only be used in a server.",
@@ -577,7 +560,6 @@ async def withdraw(
         return
 
     item = clean_item_name(item)
-    access_type = access.value
 
     if not item:
         await interaction.response.send_message(
@@ -587,45 +569,51 @@ async def withdraw(
         return
 
     async with database_lock:
+        cursor.execute(
+            """
+            SELECT amount
+            FROM storage
+            WHERE guild_id = ?
+            AND user_id = ?
+            AND item = ?
+            AND access_type = 'personal'
+            """,
+            (interaction.guild.id, interaction.user.id, item)
+        )
+        personal_row = cursor.fetchone()
+        personal_available = personal_row[0] if personal_row else 0
 
-        if access_type == "personal":
-            cursor.execute(
-                """
-                SELECT amount
-                FROM storage
-                WHERE guild_id = ?
-                AND user_id = ?
-                AND item = ?
-                AND access_type = 'personal'
-                """,
+        cursor.execute(
+            """
+            SELECT COALESCE(SUM(amount), 0)
+            FROM storage
+            WHERE guild_id = ?
+            AND item = ?
+            AND access_type = 'shared'
+            """,
+            (interaction.guild.id, item)
+        )
+        shared_available = cursor.fetchone()[0]
+        total_available = personal_available + shared_available
+
+        if total_available < amount:
+            await interaction.response.send_message(
                 (
-                    interaction.guild.id,
-                    interaction.user.id,
-                    item
-                )
+                    f"❌ You can only access **{total_available:,} × {item}**.\n"
+                    f"🔒 Yours: **{personal_available:,}**\n"
+                    f"🌐 Shared: **{shared_available:,}**"
+                ),
+                ephemeral=True
             )
+            return
 
-            result = cursor.fetchone()
+        personal_used = min(amount, personal_available)
+        shared_used = amount - personal_used
 
-            if not result:
-                await interaction.response.send_message(
-                    f"❌ You don't have **{item}** in personal storage.",
-                    ephemeral=True
-                )
-                return
+        if personal_used:
+            personal_remaining = personal_available - personal_used
 
-            current_amount = result[0]
-
-            if amount > current_amount:
-                await interaction.response.send_message(
-                    f"❌ You only have **{current_amount:,} × {item}** personally.",
-                    ephemeral=True
-                )
-                return
-
-            new_amount = current_amount - amount
-
-            if new_amount == 0:
+            if personal_remaining == 0:
                 cursor.execute(
                     """
                     DELETE FROM storage
@@ -634,11 +622,7 @@ async def withdraw(
                     AND item = ?
                     AND access_type = 'personal'
                     """,
-                    (
-                        interaction.guild.id,
-                        interaction.user.id,
-                        item
-                    )
+                    (interaction.guild.id, interaction.user.id, item)
                 )
             else:
                 cursor.execute(
@@ -651,48 +635,14 @@ async def withdraw(
                     AND access_type = 'personal'
                     """,
                     (
-                        new_amount,
+                        personal_remaining,
                         interaction.guild.id,
                         interaction.user.id,
                         item
                     )
                 )
 
-            remaining_text = f"{new_amount:,}"
-
-        else:
-            cursor.execute(
-                """
-                SELECT COALESCE(SUM(amount), 0)
-                FROM storage
-                WHERE guild_id = ?
-                AND item = ?
-                AND access_type = 'shared'
-                """,
-                (
-                    interaction.guild.id,
-                    item
-                )
-            )
-
-            shared_total = cursor.fetchone()[0]
-
-            if shared_total <= 0:
-                await interaction.response.send_message(
-                    f"❌ There is no shared **{item}** available.",
-                    ephemeral=True
-                )
-                return
-
-            if amount > shared_total:
-                await interaction.response.send_message(
-                    f"❌ Shared storage only has **{shared_total:,} × {item}**.",
-                    ephemeral=True
-                )
-                return
-
-            amount_left = amount
-
+        if shared_used:
             cursor.execute(
                 """
                 SELECT user_id, amount
@@ -702,21 +652,18 @@ async def withdraw(
                 AND access_type = 'shared'
                 ORDER BY rowid ASC
                 """,
-                (
-                    interaction.guild.id,
-                    item
-                )
+                (interaction.guild.id, item)
             )
 
-            deposits = cursor.fetchall()
+            remaining_to_take = shared_used
 
-            for owner_id, owner_amount in deposits:
-                if amount_left <= 0:
+            for owner_id, owner_amount in cursor.fetchall():
+                if remaining_to_take <= 0:
                     break
 
-                take = min(owner_amount, amount_left)
+                take = min(owner_amount, remaining_to_take)
                 owner_remaining = owner_amount - take
-                amount_left -= take
+                remaining_to_take -= take
 
                 if owner_remaining == 0:
                     cursor.execute(
@@ -727,11 +674,7 @@ async def withdraw(
                         AND item = ?
                         AND access_type = 'shared'
                         """,
-                        (
-                            interaction.guild.id,
-                            owner_id,
-                            item
-                        )
+                        (interaction.guild.id, owner_id, item)
                     )
                 else:
                     cursor.execute(
@@ -751,15 +694,7 @@ async def withdraw(
                         )
                     )
 
-            remaining_text = f"{shared_total - amount:,}"
-
         database.commit()
-
-    pool_text = (
-        "🔒 Personal storage"
-        if access_type == "personal"
-        else "🌐 Shared storage"
-    )
 
     embed = discord.Embed(
         title="📤 Withdrawal Successful",
@@ -770,22 +705,22 @@ async def withdraw(
         value=f"**{amount:,} × {item}**",
         inline=False
     )
-    embed.add_field(
-        name="From",
-        value=pool_text,
-        inline=False
-    )
-    embed.add_field(
-        name="Remaining in that pool",
-        value=f"**{remaining_text} × {item}**",
-        inline=False
-    )
 
-    await interaction.response.send_message(
-        embed=embed,
-        ephemeral=True
-    )
+    if personal_used:
+        embed.add_field(
+            name="🔒 From Your Personal Storage",
+            value=f"**{personal_used:,}**",
+            inline=True
+        )
 
+    if shared_used:
+        embed.add_field(
+            name="🌐 From Shared Storage",
+            value=f"**{shared_used:,}**",
+            inline=True
+        )
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
     await update_storage_panel(interaction.guild)
 
 
