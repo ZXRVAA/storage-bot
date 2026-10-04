@@ -102,12 +102,22 @@ class StorageBot(commands.Bot):
         guild = discord.Object(id=GUILD_ID)
 
         try:
+            # Copy the current command definitions into this server first.
             self.tree.clear_commands(guild=guild)
             self.tree.copy_global_to(guild=guild)
-            synced = await self.tree.sync(guild=guild)
+
+            # Remove old GLOBAL commands from Discord so duplicate commands vanish.
+            self.tree.clear_commands(guild=None)
+            global_synced = await self.tree.sync()
 
             print("")
             print("=" * 55)
+            print("Old global slash commands cleared from Discord.")
+            print(f"Global commands remaining: {len(global_synced)}")
+
+            # Keep only the current commands in your server.
+            synced = await self.tree.sync(guild=guild)
+
             print(f"Synced {len(synced)} commands to server {GUILD_ID}")
 
             for command in synced:
@@ -1128,6 +1138,10 @@ async def command_error(
         print(
             f"Slash command error: {repr(error)}"
         )
+
+        original = getattr(error, "original", None)
+        if original is not None:
+            print(f"Underlying error: {repr(original)}")
 
         message = (
             "❌ Something went wrong while "
